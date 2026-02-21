@@ -108,6 +108,11 @@ type ProtocolTraceEntry = {
   ok: boolean,
 };
 
+type LocalFallbackResult = {
+  updatedSource: string,
+  summary: string,
+};
+
 export default function ViewerPanel({className, style}: {className?: string, style?: CSSProperties}) {
   const model = useContext(ModelContext);
   if (!model) throw new Error('No model');
@@ -175,18 +180,17 @@ export default function ViewerPanel({className, style}: {className?: string, sty
     }]).slice(-120));
   }, []);
 
-  const applyLocalFallbackEdit = useCallback((source: string, commentText: string) => {
+  const applyLocalFallbackEdit = useCallback((source: string, commentText: string): LocalFallbackResult | undefined => {
     const normalized = commentText.toLowerCase();
     const asksTop = /\b(add|create|make)\b/.test(normalized) && /\btop\b/.test(normalized);
     const asksHole = /\bhole\b/.test(normalized) || /\bcenter\b/.test(normalized) || /\bcentre\b/.test(normalized);
+    const asksMouthpiece = /\bergonomic\b/.test(normalized) || /\bmouthpiece\b/.test(normalized);
     const marker = '// AUTO_FALLBACK_TOP_WITH_CENTER_HOLE';
-    if (!asksTop || !asksHole || source.includes(marker)) {
+    if ((!asksTop || !asksHole) && !asksMouthpiece) {
       return undefined;
     }
 
-    const snippet = `
-
-${marker}
+    const centerHoleBlock = `${marker}
 module auto_fallback_top_with_center_hole() {
     top_outer_d = (base_d * top_scale);
     top_hole_d = vent_d * 0.8;
@@ -198,9 +202,62 @@ module auto_fallback_top_with_center_hole() {
         }
 }
 
-auto_fallback_top_with_center_hole();
-`;
-    return `${source.trimEnd()}${snippet}`;
+auto_fallback_top_with_center_hole();`;
+
+    const mouthpieceBlock = `${marker}
+// AUTO_FALLBACK_MOUTHPIECE
+module auto_fallback_top_with_center_hole() {
+    top_outer_d = (base_d * top_scale);
+    mouthpiece_major_d = vent_d * 0.62;
+    mouthpiece_minor_d = vent_d * 0.46;
+    mouthpiece_offset = vent_d * 0.17;
+
+    module ergonomic_mouthpiece_cutout() {
+        linear_extrude(height = wall + 0.2)
+            hull() {
+                translate([0, mouthpiece_offset, 0])
+                    circle(d = mouthpiece_major_d);
+                translate([0, -mouthpiece_offset, 0])
+                    circle(d = mouthpiece_minor_d);
+            }
+    }
+
+    translate([0, 0, height])
+        difference() {
+            cylinder(h = wall, d = top_outer_d);
+            translate([0, 0, -0.1])
+                ergonomic_mouthpiece_cutout();
+        }
+}
+
+auto_fallback_top_with_center_hole();`;
+
+    const fallbackBlockRegex = /\/\/ AUTO_FALLBACK_TOP_WITH_CENTER_HOLE[\s\S]*?auto_fallback_top_with_center_hole\(\);/m;
+
+    if (asksMouthpiece) {
+      if (fallbackBlockRegex.test(source)) {
+        return {
+          updatedSource: source.replace(fallbackBlockRegex, mouthpieceBlock),
+          summary: 'Adjusted top opening to ergonomic mouthpiece',
+        };
+      }
+      return {
+        updatedSource: `${source.trimEnd()}\n\n${mouthpieceBlock}\n`,
+        summary: 'Added top with ergonomic mouthpiece opening',
+      };
+    }
+
+    if (source.includes(marker)) {
+      return {
+        updatedSource: source,
+        summary: 'Top with center hole already present',
+      };
+    }
+
+    return {
+      updatedSource: `${source.trimEnd()}\n\n${centerHoleBlock}\n`,
+      summary: 'Added top with center hole',
+    };
   }, []);
 
   const setValidationCheck = useCallback((id: ValidationCheck['id'], update: {status: ValidationCheck['status'], detail: string}) => {
@@ -439,6 +496,14 @@ auto_fallback_top_with_center_hole();
           payload: 'No deterministic local transformation available for this comment',
           ok: false,
         });
+        window.dispatchEvent(new CustomEvent<CommentCopilotEditResponse>('openscad-playground-comment-edit-response', {
+          detail: {
+            requestId,
+            commentId: comment.id,
+            error: 'Local fallback has no deterministic transform for this request',
+            summary: 'Fallback unsupported for this comment',
+          },
+        }));
         return;
       }
 
@@ -452,8 +517,8 @@ auto_fallback_top_with_center_hole();
         detail: {
           requestId,
           commentId: comment.id,
-          updatedSource: nextSource,
-          summary: 'Applied local fallback update',
+          updatedSource: nextSource.updatedSource,
+          summary: nextSource.summary,
         },
       }));
     }, 1500);
