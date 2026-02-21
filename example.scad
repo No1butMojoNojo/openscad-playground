@@ -1,4 +1,4 @@
-export default `/* ===========================================
+/* ===========================================
    Medify MA-12 Pro
    Accurate Circular + True Perforations
    SINGLE MANIFOLD SOLID
@@ -87,4 +87,3 @@ difference(){
         }
     }
 }
-`;

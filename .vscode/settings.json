@@ -1,0 +1,7 @@
+{
+    "chat.tools.terminal.autoApprove": {
+        "npx kill-port": true,
+        "make": true,
+        "gp": true
+    }
+}
