@@ -1,6 +1,6 @@
 // Portions of this file are Copyright 2021 Google LLC, and licensed under GPL2+. See COPYING.
 
-import React, { CSSProperties, useContext, useRef, useState } from 'react';
+import React, { CSSProperties, useContext, useEffect, useRef, useState } from 'react';
 import Editor, { loader, Monaco } from '@monaco-editor/react';
 import openscadEditorOptions from '../language/openscad-editor-options.ts';
 import * as monaco from 'monaco-editor/esm/vs/editor/editor.api';
@@ -33,6 +33,19 @@ export default function EditorPanel({className, style}: {className?: string, sty
   const menu = useRef<Menu>(null);
 
   const state = model.state;
+
+  const [prefersDarkMode, setPrefersDarkMode] = useState(() => window.matchMedia('(prefers-color-scheme: dark)').matches);
+
+  useEffect(() => {
+    const mediaQuery = window.matchMedia('(prefers-color-scheme: dark)');
+    const onThemeChange = (event: MediaQueryListEvent) => setPrefersDarkMode(event.matches);
+    if (typeof mediaQuery.addEventListener === 'function') {
+      mediaQuery.addEventListener('change', onThemeChange);
+      return () => mediaQuery.removeEventListener('change', onThemeChange);
+    }
+    mediaQuery.addListener(onThemeChange);
+    return () => mediaQuery.removeListener(onThemeChange);
+  }, []);
 
   const [editor, setEditor] = useState(null as monaco.editor.IStandaloneCodeEditor | null)
 
@@ -167,6 +180,7 @@ export default function EditorPanel({className, style}: {className?: string, sty
           <Editor
             className="openscad-editor absolute-fill"
             defaultLanguage="openscad"
+            theme={prefersDarkMode ? 'vs-dark' : 'vs-light'}
             path={state.params.activePath}
             value={model.source}
             onChange={s => model.source = s ?? ''}

@@ -6,9 +6,19 @@ body {
     sans-serif; */
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
+  background: var(--app-bg);
+  color: var(--app-text);
 }
 
 :root {
+  --app-bg: #f3f5f8;
+  --app-surface: #ffffff;
+  --app-surface-2: #f7f8fa;
+  --app-border: #d7dce3;
+  --app-text: #1f2937;
+  --app-muted: #6b7280;
+  --app-shadow: 0 2px 10px rgba(17, 24, 39, 0.08);
+
   --viewer-debug-bg: rgba(255, 255, 255, 0.92);
   --viewer-debug-border: #d7dce3;
   --viewer-debug-surface: #f7f8fa;
@@ -16,13 +26,138 @@ body {
   --viewer-debug-muted: #6b7280;
 }
 
+html, body, #root {
+  height: 100%;
+}
+
+#root {
+  background: var(--app-bg);
+  color: var(--app-text);
+}
+
+.absolute-fill {
+  position: absolute;
+  inset: 0;
+}
+
+.editor-panel,
+.main-viewer,
+.openscad-editor {
+  color: var(--app-text);
+}
+
+.p-component,
+.p-menu,
+.p-dialog,
+.p-treeselect-panel,
+.p-dropdown-panel,
+.p-overlaypanel {
+  color: var(--app-text);
+}
+
+.p-inputtext,
+.p-inputtextarea,
+.p-treeselect,
+.p-button,
+.p-menu,
+.p-dialog .p-dialog-content,
+.p-dialog .p-dialog-header,
+.p-progressbar {
+  border-color: var(--app-border);
+}
+
+.p-inputtext,
+.p-inputtextarea,
+.p-treeselect,
+.p-menu,
+.p-dialog .p-dialog-content,
+.p-dialog .p-dialog-header,
+.p-treeselect-panel,
+.p-dropdown-panel,
+.p-overlaypanel {
+  background: var(--app-surface);
+}
+
+.p-button {
+  box-shadow: var(--app-shadow);
+}
+
+.p-button.p-button-text,
+.p-button.p-button-link {
+  box-shadow: none;
+}
+
 @media (prefers-color-scheme: dark) {
   :root {
+    --app-bg: #0b1220;
+    --app-surface: #111827;
+    --app-surface-2: #1f2937;
+    --app-border: #374151;
+    --app-text: #e5e7eb;
+    --app-muted: #9ca3af;
+    --app-shadow: 0 4px 16px rgba(0, 0, 0, 0.35);
+
     --viewer-debug-bg: rgba(20, 23, 28, 0.94);
     --viewer-debug-border: #374151;
     --viewer-debug-surface: #111827;
     --viewer-debug-text: #e5e7eb;
     --viewer-debug-muted: #9ca3af;
+  }
+
+  html {
+    color-scheme: dark;
+  }
+
+  body,
+  #root {
+    background: var(--app-bg);
+    color: var(--app-text);
+  }
+
+  .p-inputtext,
+  .p-inputtextarea,
+  .p-treeselect,
+  .p-menu,
+  .p-dialog .p-dialog-content,
+  .p-dialog .p-dialog-header,
+  .p-treeselect-panel,
+  .p-dropdown-panel,
+  .p-overlaypanel {
+    background: var(--app-surface);
+    border-color: var(--app-border);
+    color: var(--app-text);
+  }
+
+  .p-dialog .p-dialog-footer,
+  .p-treeselect-panel .p-treenode-content,
+  .p-menu .p-menuitem-content,
+  .p-progressbar {
+    background: var(--app-surface-2);
+    color: var(--app-text);
+  }
+
+  .p-treeselect-label,
+  .p-inputtext::placeholder,
+  .p-inputtextarea::placeholder,
+  .p-menu .p-menuitem-text,
+  .p-dialog .p-dialog-title {
+    color: var(--app-text);
+  }
+
+  .p-button.p-button-secondary,
+  .p-button.p-button-text,
+  .p-button.p-button-link {
+    color: var(--app-text);
+  }
+
+  .p-button:not(.p-button-text):not(.p-button-link) {
+    background: #334155;
+    border-color: #475569;
+    color: #f8fafc;
+  }
+
+  .p-progressbar {
+    border: 1px solid var(--app-border);
   }
 }
 
