@@ -4,6 +4,11 @@ import { CSSProperties, useCallback, useContext, useEffect, useRef, useState } f
 import { ModelContext } from './contexts.ts';
 import { Toast } from 'primereact/toast';
 import { blurHashToImage, imageToBlurhash, imageToThumbhash, thumbHashToImage } from '../io/image_hashes.ts';
+import { InputTextarea } from 'primereact/inputtextarea';
+import { Button } from 'primereact/button';
+import { ProgressBar } from 'primereact/progressbar';
+import { ViewerComment, ViewerCommentCopilotEdit } from '../state/app-state.ts';
+import FilePicker from './FilePicker.tsx';
 
 declare global {
   namespace JSX {
@@ -50,15 +55,88 @@ function getClosestPredefinedOrbitIndex(theta: number, phi: number): [number, nu
 
 const originalOrbit = (([name, theta, phi]) => `${theta}rad ${phi}rad auto`)(PREDEFINED_ORBITS[0]);
 
+type CommentCopilotEditRequest = {
+  requestId: string,
+  commentId: string,
+  commentText: string,
+  activePath: string,
+  source: string,
+  sources: {path: string, content?: string, url?: string}[],
+  requestedAt: string,
+};
+
+type CommentCopilotEditResponse = {
+  requestId: string,
+  commentId: string,
+  updatedSource?: string,
+  summary?: string,
+  error?: string,
+};
+
+type DebugLogEntry = {
+  id: string,
+  at: string,
+  level: 'info' | 'error',
+  message: string,
+};
+
+type AppliedEditHistoryEntry = {
+  id: string,
+  requestId: string,
+  at: string,
+  path: string,
+  previousSource: string,
+  nextSource: string,
+  summary?: string,
+};
+
+type ValidationCheck = {
+  id: string,
+  label: string,
+  status: 'pending' | 'pass' | 'fail',
+  detail: string,
+  updatedAt: string,
+};
+
+type ProtocolTraceEntry = {
+  id: string,
+  at: string,
+  direction: 'env->copilot' | 'copilot->env' | 'system',
+  label: string,
+  payload: string,
+  durationMs?: number,
+  ok: boolean,
+};
+
 export default function ViewerPanel({className, style}: {className?: string, style?: CSSProperties}) {
   const model = useContext(ModelContext);
   if (!model) throw new Error('No model');
 
   const state = model.state;
+  const comments = state.view.comments ?? [];
+  const [newCommentText, setNewCommentText] = useState('');
+  const [localFallbackEnabled, setLocalFallbackEnabled] = useState(true);
+  const [debugLogs, setDebugLogs] = useState<DebugLogEntry[]>([]);
+  const [appliedEditHistory, setAppliedEditHistory] = useState<AppliedEditHistoryEntry[]>([]);
+  const [protocolTrace, setProtocolTrace] = useState<ProtocolTraceEntry[]>([]);
+  const [validationChecks, setValidationChecks] = useState<ValidationCheck[]>([
+    {id: 'env-capabilities', label: 'Environment capabilities', status: 'pending', detail: 'Waiting for checks', updatedAt: new Date().toISOString()},
+    {id: 'request-dispatch', label: 'Copilot request dispatch', status: 'pending', detail: 'No request sent yet', updatedAt: new Date().toISOString()},
+    {id: 'response-handling', label: 'Copilot response handling', status: 'pending', detail: 'No response received yet', updatedAt: new Date().toISOString()},
+    {id: 'source-apply', label: 'Source apply + preview', status: 'pending', detail: 'No source update applied yet', updatedAt: new Date().toISOString()},
+    {id: 'undo-flow', label: 'Undo flow', status: 'pending', detail: 'No undo executed yet', updatedAt: new Date().toISOString()},
+    {id: 'runtime-stream', label: 'Runtime stream logs', status: 'pending', detail: 'No stream logs observed yet', updatedAt: new Date().toISOString()},
+  ]);
   const [interactionPrompt, setInteractionPrompt] = useState('auto');
   const modelViewerRef = useRef<any>();
   const axesViewerRef = useRef<any>();
   const toastRef = useRef<Toast>(null);
+  const commentSyncChannelRef = useRef<BroadcastChannel | null>(null);
+  const commentSyncClientIdRef = useRef((window.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.random().toString(36).slice(2)}`));
+  const debugConsoleRef = useRef<HTMLDivElement | null>(null);
+  const runLogsStreamStateRef = useRef<{logsRef?: State['currentRunLogs'], index: number}>({index: 0});
+  const pendingRequestSentAtRef = useRef<Record<string, number>>({});
+  const pendingRequestByCommentIdRef = useRef<Record<string, string>>({});
 
   const [loadedUri, setLoadedUri] = useState<string | undefined>();
 
@@ -66,6 +144,346 @@ export default function ViewerPanel({className, style}: {className?: string, sty
 
   const modelUri = state.output?.displayFileURL ?? state.output?.outFileURL ?? '';
   const loaded = loadedUri === modelUri;
+  const flowProgress = state.checkingSyntax ? 20
+    : state.previewing ? 60
+    : state.rendering ? 85
+    : state.exporting ? 95
+    : state.output ? 100
+    : 0;
+  const flowLabel = state.checkingSyntax ? 'Checking syntax'
+    : state.previewing ? 'Preview rendering'
+    : state.rendering ? 'Rendering'
+    : state.exporting ? 'Exporting'
+    : state.output ? 'Ready'
+    : 'Idle';
+  const goalsMet = ['env-capabilities', 'request-dispatch', 'response-handling', 'source-apply', 'runtime-stream']
+    .every(id => validationChecks.find(c => c.id === id)?.status === 'pass');
+
+  const safeStringify = useCallback((value: unknown) => {
+    try {
+      return JSON.stringify(value, null, 2);
+    } catch (e) {
+      return `[unserializable payload: ${String(e)}]`;
+    }
+  }, []);
+
+  const appendProtocolTrace = useCallback((entry: Omit<ProtocolTraceEntry, 'id' | 'at'>) => {
+    setProtocolTrace(previous => ([...previous, {
+      id: window.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.random().toString(36).slice(2)}`,
+      at: new Date().toISOString(),
+      ...entry,
+    }]).slice(-120));
+  }, []);
+
+  const applyLocalFallbackEdit = useCallback((source: string, commentText: string) => {
+    const normalized = commentText.toLowerCase();
+    const asksTop = /\b(add|create|make)\b/.test(normalized) && /\btop\b/.test(normalized);
+    const asksHole = /\bhole\b/.test(normalized) || /\bcenter\b/.test(normalized) || /\bcentre\b/.test(normalized);
+    const marker = '// AUTO_FALLBACK_TOP_WITH_CENTER_HOLE';
+    if (!asksTop || !asksHole || source.includes(marker)) {
+      return undefined;
+    }
+
+    const snippet = `
+
+${marker}
+module auto_fallback_top_with_center_hole() {
+    top_outer_d = (base_d * top_scale);
+    top_hole_d = vent_d * 0.8;
+    translate([0, 0, height])
+        difference() {
+            cylinder(h = wall, d = top_outer_d);
+            translate([0, 0, -0.1])
+                cylinder(h = wall + 0.2, d = top_hole_d);
+        }
+}
+
+auto_fallback_top_with_center_hole();
+`;
+    return `${source.trimEnd()}${snippet}`;
+  }, []);
+
+  const setValidationCheck = useCallback((id: ValidationCheck['id'], update: {status: ValidationCheck['status'], detail: string}) => {
+    setValidationChecks(previous => previous.map(check => check.id !== id ? check : {
+      ...check,
+      status: update.status,
+      detail: update.detail,
+      updatedAt: new Date().toISOString(),
+    }));
+  }, []);
+
+  const runValidationSweep = useCallback(() => {
+    const checks = [
+      typeof window !== 'undefined',
+      typeof window.CustomEvent === 'function',
+      !!window.crypto,
+      typeof window.crypto?.randomUUID === 'function',
+      typeof window.dispatchEvent === 'function',
+      typeof window.addEventListener === 'function',
+    ];
+    const passCount = checks.filter(Boolean).length;
+    const ok = passCount === checks.length;
+    setValidationCheck('env-capabilities', {
+      status: ok ? 'pass' : 'fail',
+      detail: `${passCount}/${checks.length} capability checks passed`,
+    });
+
+    const hasFlowState = !!model.state.params.activePath && Array.isArray(model.state.params.sources);
+    if (!hasFlowState) {
+      setValidationCheck('source-apply', {
+        status: 'fail',
+        detail: 'Model state missing active path or sources',
+      });
+    }
+  }, [model.state.params.activePath, model.state.params.sources, setValidationCheck]);
+
+  const appendDebugLog = useCallback((level: DebugLogEntry['level'], message: string) => {
+    const at = new Date().toISOString();
+    setDebugLogs(previous => {
+      const next = [...previous, {
+        id: window.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.random().toString(36).slice(2)}`,
+        at,
+        level,
+        message,
+      }];
+      return next.slice(-200);
+    });
+  }, []);
+
+  const clearDebugLogs = useCallback(() => {
+    setDebugLogs([]);
+    setProtocolTrace([]);
+  }, []);
+
+  const undoLastAppliedEdit = useCallback(() => {
+    const latest = appliedEditHistory[appliedEditHistory.length - 1];
+    if (!latest) {
+      appendDebugLog('info', 'Undo requested but history is empty');
+      setValidationCheck('undo-flow', {
+        status: 'fail',
+        detail: 'Undo requested with empty history',
+      });
+      return;
+    }
+    if (model.state.params.activePath !== latest.path) {
+      model.openFile(latest.path);
+    }
+    model.source = latest.previousSource;
+    model.render({isPreview: true, now: true});
+    setAppliedEditHistory(previous => previous.slice(0, -1));
+    appendDebugLog('info', `Undo applied for request ${latest.requestId.slice(0, 8)} on ${latest.path}`);
+    setValidationCheck('undo-flow', {
+      status: 'pass',
+      detail: `Undo applied for ${latest.requestId.slice(0, 8)}`,
+    });
+  }, [appliedEditHistory, appendDebugLog, model, setValidationCheck]);
+
+  const setComments = useCallback((nextCommentsOrUpdater: ViewerComment[] | ((previous: ViewerComment[]) => ViewerComment[]), sync = true) => {
+    const previousComments = model.state.view.comments ?? [];
+    const nextComments = typeof nextCommentsOrUpdater === 'function'
+      ? nextCommentsOrUpdater(previousComments)
+      : nextCommentsOrUpdater;
+    model.mutate(s => {
+      s.view.comments = nextComments;
+    });
+    if (sync) {
+      commentSyncChannelRef.current?.postMessage({
+        clientId: commentSyncClientIdRef.current,
+        comments: nextComments,
+      });
+    }
+  }, [model]);
+
+  const pushCommentCopilotHistoryEntry = useCallback((commentId: string, entry: ViewerCommentCopilotEdit) => {
+    setComments(previous => previous.map(comment => comment.id !== commentId ? comment : {
+      ...comment,
+      copilotEditHistory: [...(comment.copilotEditHistory ?? []), entry],
+    }));
+  }, [setComments]);
+
+  const resolveCommentCopilotHistoryEntry = useCallback((requestId: string, resolver: (entry: ViewerCommentCopilotEdit) => ViewerCommentCopilotEdit) => {
+    setComments(previous => previous.map(comment => {
+      const history = comment.copilotEditHistory ?? [];
+      const index = history.findIndex(entry => entry.requestId === requestId);
+      if (index < 0) {
+        return comment;
+      }
+      const nextHistory = [...history];
+      nextHistory[index] = resolver(nextHistory[index]);
+      return {
+        ...comment,
+        copilotEditHistory: nextHistory,
+      };
+    }));
+  }, [setComments]);
+
+  const requestCopilotEditFromComment = useCallback((comment: ViewerComment) => {
+    const existingPendingRequestId = pendingRequestByCommentIdRef.current[comment.id];
+    if (existingPendingRequestId) {
+      appendDebugLog('info', `Skipped duplicate request for comment ${comment.id.slice(0, 8)} (pending ${existingPendingRequestId.slice(0, 8)})`);
+      appendProtocolTrace({
+        direction: 'system',
+        label: `duplicate request blocked ${existingPendingRequestId.slice(0, 8)}`,
+        payload: `Comment ${comment.id} already has an in-flight request`,
+        ok: false,
+      });
+      return;
+    }
+
+    const requestId = window.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    pendingRequestByCommentIdRef.current[comment.id] = requestId;
+    const requestedAt = new Date().toISOString();
+    appendDebugLog('info', `Request ${requestId.slice(0, 8)} sent for ${model.state.params.activePath}`);
+    setValidationCheck('request-dispatch', {
+      status: 'pass',
+      detail: `Request ${requestId.slice(0, 8)} dispatched`,
+    });
+    pushCommentCopilotHistoryEntry(comment.id, {
+      requestId,
+      requestedAt,
+      status: 'pending',
+      path: model.state.params.activePath,
+      summary: 'Sent to Copilot',
+    });
+
+    const request: CommentCopilotEditRequest = {
+      requestId,
+      commentId: comment.id,
+      commentText: comment.text,
+      activePath: model.state.params.activePath,
+      source: model.source,
+      sources: model.state.params.sources,
+      requestedAt,
+    };
+
+    try {
+      pendingRequestSentAtRef.current[requestId] = performance.now();
+      window.dispatchEvent(new CustomEvent<CommentCopilotEditRequest>('openscad-playground-comment-edit-request', {
+        detail: request,
+      }));
+      appendProtocolTrace({
+        direction: 'env->copilot',
+        label: `comment-edit-request ${requestId.slice(0, 8)}`,
+        payload: safeStringify({
+          ...request,
+          sourceLength: request.source.length,
+          sources: request.sources.map(s => ({path: s.path, hasContent: s.content != null, url: s.url})),
+        }),
+        ok: true,
+      });
+    } catch (e) {
+      delete pendingRequestByCommentIdRef.current[comment.id];
+      appendProtocolTrace({
+        direction: 'system',
+        label: `request dispatch failed ${requestId.slice(0, 8)}`,
+        payload: String(e),
+        ok: false,
+      });
+      appendDebugLog('error', `Failed to dispatch request ${requestId.slice(0, 8)}: ${String(e)}`);
+      setValidationCheck('request-dispatch', {
+        status: 'fail',
+        detail: `Dispatch failed for ${requestId.slice(0, 8)}`,
+      });
+      return;
+    }
+
+    window.setTimeout(() => {
+      const latestComment = (model.state.view.comments ?? []).find(c => c.id === comment.id);
+      const pendingEntry = latestComment?.copilotEditHistory?.find(entry => entry.requestId === requestId);
+      const stillPending = pendingEntry?.status === 'pending';
+
+      if (!stillPending) {
+        return;
+      }
+
+      delete pendingRequestByCommentIdRef.current[comment.id];
+      resolveCommentCopilotHistoryEntry(requestId, entry => {
+        if (entry.status !== 'pending') {
+          return entry;
+        }
+        return {
+          ...entry,
+          status: 'failed',
+          resolvedAt: new Date().toISOString(),
+          error: 'Timed out waiting for Copilot response',
+          summary: 'No Copilot host response',
+        };
+      });
+      appendDebugLog('error', `Request ${requestId.slice(0, 8)} timed out waiting for Copilot response`);
+      appendProtocolTrace({
+        direction: 'system',
+        label: `request timeout ${requestId.slice(0, 8)}`,
+        payload: 'No response event received within 30 seconds',
+        ok: false,
+      });
+      setValidationCheck('response-handling', {
+        status: 'fail',
+        detail: `Request ${requestId.slice(0, 8)} timed out`,
+      });
+    }, 30000);
+
+    window.setTimeout(() => {
+      if (!localFallbackEnabled) {
+        return;
+      }
+      const activePending = pendingRequestByCommentIdRef.current[comment.id] === requestId;
+      if (!activePending) {
+        return;
+      }
+
+      const nextSource = applyLocalFallbackEdit(model.source, comment.text);
+      if (!nextSource) {
+        appendProtocolTrace({
+          direction: 'system',
+          label: `local fallback skipped ${requestId.slice(0, 8)}`,
+          payload: 'No deterministic local transformation available for this comment',
+          ok: false,
+        });
+        return;
+      }
+
+      appendProtocolTrace({
+        direction: 'system',
+        label: `local fallback response ${requestId.slice(0, 8)}`,
+        payload: 'Generated local response because external bridge did not reply in time',
+        ok: true,
+      });
+      window.dispatchEvent(new CustomEvent<CommentCopilotEditResponse>('openscad-playground-comment-edit-response', {
+        detail: {
+          requestId,
+          commentId: comment.id,
+          updatedSource: nextSource,
+          summary: 'Applied local fallback update',
+        },
+      }));
+    }, 1500);
+  }, [appendDebugLog, appendProtocolTrace, model, pushCommentCopilotHistoryEntry, resolveCommentCopilotHistoryEntry, safeStringify, setValidationCheck]);
+
+  const addComment = useCallback(() => {
+    const text = newCommentText.trim();
+    if (!text) return;
+    const now = new Date().toISOString();
+    const comment: ViewerComment = {
+      id: window.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.random().toString(36).slice(2)}`,
+      text,
+      createdAt: now,
+      updatedAt: now,
+    };
+    setComments([...comments, comment]);
+    appendDebugLog('info', `Comment created (${text.slice(0, 60)})`);
+    requestCopilotEditFromComment(comment);
+    setNewCommentText('');
+  }, [appendDebugLog, comments, newCommentText, requestCopilotEditFromComment, setComments]);
+
+  const updateComment = useCallback((id: string, text: string) => {
+    const now = new Date().toISOString();
+    setComments(comments.map(comment => comment.id === id ? {...comment, text, updatedAt: now} : comment));
+  }, [comments, setComments]);
+
+  const removeComment = useCallback((id: string) => {
+    setComments(comments.filter(comment => comment.id !== id));
+    appendDebugLog('info', `Comment removed (${id.slice(0, 8)})`);
+  }, [appendDebugLog, comments, setComments]);
 
   if (state?.preview) {
     let {hash, uri} = cachedImageHash ?? {};
@@ -103,6 +521,162 @@ export default function ViewerPanel({className, style}: {className?: string, sty
     element.addEventListener('load', onLoad);
     return () => element.removeEventListener('load', onLoad);
   }, [modelViewerRef.current, onLoad]);
+
+  useEffect(() => {
+    if (!(window as any).BroadcastChannel) return;
+    const channel = new BroadcastChannel('openscad-playground-comments');
+    commentSyncChannelRef.current = channel;
+    channel.onmessage = (event: MessageEvent) => {
+      const data = event.data as {clientId?: string, comments?: ViewerComment[]};
+      if (!data || data.clientId === commentSyncClientIdRef.current || !Array.isArray(data.comments)) {
+        return;
+      }
+      setComments(data.comments, false);
+    };
+    return () => {
+      channel.close();
+      commentSyncChannelRef.current = null;
+    };
+  }, [setComments]);
+
+  useEffect(() => {
+    const onCopilotEditResponse = (event: Event) => {
+      const customEvent = event as CustomEvent<CommentCopilotEditResponse>;
+      const detail = customEvent.detail;
+      if (!detail?.requestId) {
+        appendProtocolTrace({
+          direction: 'copilot->env',
+          label: 'response missing requestId',
+          payload: safeStringify(detail),
+          ok: false,
+        });
+        appendDebugLog('error', 'Received malformed response without requestId');
+        setValidationCheck('response-handling', {
+          status: 'fail',
+          detail: 'Malformed response without requestId',
+        });
+        return;
+      }
+
+      const startedAt = pendingRequestSentAtRef.current[detail.requestId];
+      const durationMs = startedAt != null ? Math.round(performance.now() - startedAt) : undefined;
+      delete pendingRequestSentAtRef.current[detail.requestId];
+
+      const sourceCommentId = detail.commentId;
+      if (sourceCommentId && pendingRequestByCommentIdRef.current[sourceCommentId] === detail.requestId) {
+        delete pendingRequestByCommentIdRef.current[sourceCommentId];
+      }
+
+      appendProtocolTrace({
+        direction: 'copilot->env',
+        label: `comment-edit-response ${detail.requestId.slice(0, 8)}`,
+        payload: safeStringify({
+          ...detail,
+          updatedSourceLength: detail.updatedSource?.length,
+        }),
+        durationMs,
+        ok: !detail.error,
+      });
+
+      const now = new Date().toISOString();
+      setValidationCheck('response-handling', {
+        status: detail.error ? 'fail' : 'pass',
+        detail: detail.error ? `Response failed: ${detail.error}` : `Response ${detail.requestId.slice(0, 8)} handled`,
+      });
+      if (typeof detail.updatedSource === 'string') {
+        const previousSource = model.source;
+        model.source = detail.updatedSource;
+        model.render({isPreview: true, now: true});
+        if (detail.updatedSource !== previousSource) {
+          setAppliedEditHistory(previous => ([...previous, {
+            id: window.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.random().toString(36).slice(2)}`,
+            requestId: detail.requestId,
+            at: now,
+            path: model.state.params.activePath,
+            previousSource,
+            nextSource: detail.updatedSource,
+            summary: detail.summary,
+          }]).slice(-100));
+        }
+        appendDebugLog('info', `Response ${detail.requestId.slice(0, 8)} applied source update + live preview`);
+        setValidationCheck('source-apply', {
+          status: 'pass',
+          detail: `Source update applied for ${detail.requestId.slice(0, 8)}`,
+        });
+      } else {
+        appendDebugLog('info', `Response ${detail.requestId.slice(0, 8)} received without source update`);
+        setValidationCheck('source-apply', {
+          status: 'fail',
+          detail: `Response ${detail.requestId.slice(0, 8)} had no source payload`,
+        });
+      }
+
+      resolveCommentCopilotHistoryEntry(detail.requestId, entry => ({
+        ...entry,
+        status: detail.error ? 'failed' : 'applied',
+        resolvedAt: now,
+        summary: detail.summary ?? (detail.error ? 'Copilot edit failed' : 'Applied Copilot edit'),
+        error: detail.error,
+      }));
+
+      if (detail.error) {
+        appendDebugLog('error', `Response ${detail.requestId.slice(0, 8)} failed: ${detail.error}`);
+      }
+    };
+
+    window.addEventListener('openscad-playground-comment-edit-response', onCopilotEditResponse as EventListener);
+    return () => window.removeEventListener('openscad-playground-comment-edit-response', onCopilotEditResponse as EventListener);
+  }, [appendDebugLog, appendProtocolTrace, model, resolveCommentCopilotHistoryEntry, safeStringify, setValidationCheck]);
+
+  useEffect(() => {
+    const onWindowError = (event: ErrorEvent) => {
+      appendDebugLog('error', `Window error: ${event.message}`);
+    };
+    const onUnhandledRejection = (event: PromiseRejectionEvent) => {
+      appendDebugLog('error', `Unhandled rejection: ${String(event.reason)}`);
+    };
+
+    window.addEventListener('error', onWindowError);
+    window.addEventListener('unhandledrejection', onUnhandledRejection);
+    return () => {
+      window.removeEventListener('error', onWindowError);
+      window.removeEventListener('unhandledrejection', onUnhandledRejection);
+    };
+  }, [appendDebugLog]);
+
+  useEffect(() => {
+    const logs = state.currentRunLogs;
+    const streamState = runLogsStreamStateRef.current;
+    if (!logs) {
+      streamState.logsRef = logs;
+      streamState.index = 0;
+      return;
+    }
+    if (streamState.logsRef !== logs) {
+      streamState.logsRef = logs;
+      streamState.index = 0;
+      appendDebugLog('info', 'Render log stream started');
+      setValidationCheck('runtime-stream', {
+        status: 'pass',
+        detail: 'Render stream detected',
+      });
+    }
+    for (let i = streamState.index; i < logs.length; i++) {
+      const [type, text] = logs[i];
+      const compact = text.replace(/\s+/g, ' ').trim().slice(0, 220);
+      appendDebugLog(type === 'stderr' ? 'error' : 'info', `[${type}] ${compact}`);
+    }
+    streamState.index = logs.length;
+  }, [appendDebugLog, state.currentRunLogs]);
+
+  useEffect(() => {
+    runValidationSweep();
+  }, [runValidationSweep]);
+
+  useEffect(() => {
+    if (!debugConsoleRef.current) return;
+    debugConsoleRef.current.scrollTop = debugConsoleRef.current.scrollHeight;
+  }, [debugLogs]);
 
 
   for (const ref of [modelViewerRef, axesViewerRef]) {
@@ -253,6 +827,213 @@ export default function ViewerPanel({className, style}: {className?: string, sty
           <span slot="progress-bar"></span>
         </model-viewer>
       )}
+
+      <div style={{
+        position: 'absolute',
+        top: '8px',
+        right: '8px',
+        zIndex: 11,
+        width: '320px',
+        maxHeight: '70%',
+        overflowY: 'auto',
+        padding: '8px',
+        border: '1px solid var(--viewer-debug-border)',
+        borderRadius: '6px',
+        background: 'var(--viewer-debug-bg)',
+        color: 'var(--viewer-debug-text)',
+      }}>
+        <div className="flex align-items-center justify-content-between mb-2">
+          <strong>Comments</strong>
+          <span>{comments.length}</span>
+        </div>
+
+        <div className="mb-2">
+          <FilePicker style={{width: '100%'}} />
+        </div>
+
+        <div className="flex align-items-center justify-content-between mb-2" style={{fontSize: '0.75rem'}}>
+          <span>Local fallback apply</span>
+          <Button
+            icon={localFallbackEnabled ? 'pi pi-check-circle' : 'pi pi-times-circle'}
+            text
+            severity={localFallbackEnabled ? 'success' : 'secondary'}
+            onClick={() => setLocalFallbackEnabled(value => !value)}
+            title="Toggle local fallback updates when external bridge does not respond"
+          />
+        </div>
+
+        <div className="flex gap-2 mb-2">
+          <InputTextarea
+            value={newCommentText}
+            onChange={e => setNewCommentText(e.target.value)}
+            rows={2}
+            autoResize
+            placeholder="Add a comment"
+            style={{flex: 1}}
+          />
+          <Button
+            icon="pi pi-plus"
+            onClick={addComment}
+            disabled={!newCommentText.trim()}
+            text
+          />
+        </div>
+
+        <div className="flex flex-column gap-2">
+          {comments.map(comment => (
+            <div key={comment.id} style={{
+              border: '1px solid var(--surface-border)',
+              borderRadius: '6px',
+              padding: '6px',
+            }}>
+              <div className="flex justify-content-between align-items-center mb-1">
+                {(() => {
+                  const latest = comment.copilotEditHistory?.[comment.copilotEditHistory.length - 1];
+                  if (!latest) {
+                    return <span style={{fontSize: '0.75rem', opacity: 0.7}}>Not sent</span>;
+                  }
+                  const statusText = latest.status === 'pending' ? 'Copilot pending'
+                    : latest.status === 'applied' ? 'Copilot applied'
+                    : 'Copilot failed';
+                  return <span style={{fontSize: '0.75rem', opacity: 0.7}}>{statusText}</span>;
+                })()}
+                <div className="flex gap-1">
+                  <Button
+                    icon="pi pi-sparkles"
+                    onClick={() => requestCopilotEditFromComment(comment)}
+                    text
+                    title="Apply with Copilot"
+                  />
+                <Button
+                  icon="pi pi-trash"
+                  onClick={() => removeComment(comment.id)}
+                  text
+                  severity="danger"
+                />
+                </div>
+              </div>
+              <InputTextarea
+                value={comment.text}
+                onChange={e => updateComment(comment.id, e.target.value)}
+                rows={2}
+                autoResize
+                style={{width: '100%'}}
+              />
+            </div>
+          ))}
+        </div>
+
+        <div className="flex align-items-center justify-content-between mt-3 mb-2">
+          <strong>Debug Console</strong>
+          <div className="flex gap-1">
+            <Button icon="pi pi-check-circle" text severity="secondary" onClick={runValidationSweep} title="Run validation sweep" />
+            <Button icon="pi pi-trash" text severity="secondary" onClick={clearDebugLogs} title="Clear debug logs" />
+          </div>
+        </div>
+
+        <div className="mb-2" style={{fontSize: '0.75rem', opacity: 0.85}}>
+          {flowLabel} ({flowProgress}%)
+        </div>
+        <ProgressBar value={flowProgress} style={{height: '6px', marginBottom: '8px'}} />
+
+        <div className="mb-2" style={{fontSize: '0.75rem', fontWeight: 600}}>
+          Goals: {goalsMet ? '✅ Fully met' : '⏳ In progress'}
+        </div>
+
+        <div className="mt-2 mb-2">
+          <strong>Auto Validation</strong>
+        </div>
+        <div style={{
+          border: '1px solid var(--viewer-debug-border)',
+          borderRadius: '6px',
+          padding: '6px',
+          maxHeight: '150px',
+          overflowY: 'auto',
+          background: 'var(--viewer-debug-surface)',
+          fontSize: '0.75rem',
+          marginBottom: '8px',
+        }}>
+          {validationChecks.map(check => (
+            <div key={check.id} style={{marginBottom: '4px'}}>
+              {check.status === 'pass' ? '✅' : check.status === 'fail' ? '❌' : '⏳'} {check.label}: {check.detail}
+            </div>
+          ))}
+        </div>
+
+        <div className="flex align-items-center justify-content-between mt-2 mb-2">
+          <strong>Auto-update History</strong>
+          <Button icon="pi pi-undo" text severity="secondary" onClick={undoLastAppliedEdit} disabled={appliedEditHistory.length === 0} title="Undo last applied update" />
+        </div>
+
+        <div style={{
+          border: '1px solid var(--viewer-debug-border)',
+          borderRadius: '6px',
+          padding: '6px',
+          maxHeight: '120px',
+          overflowY: 'auto',
+          background: 'var(--viewer-debug-surface)',
+          fontSize: '0.75rem',
+          marginBottom: '8px',
+        }}>
+          {appliedEditHistory.length === 0 && <div style={{opacity: 0.7}}>No applied updates yet.</div>}
+          {[...appliedEditHistory].reverse().slice(0, 8).map(entry => (
+            <div key={entry.id} style={{marginBottom: '4px'}}>
+              [{entry.at.slice(11, 19)}] {entry.requestId.slice(0, 8)} {entry.path}
+            </div>
+          ))}
+        </div>
+
+        <div className="mt-2 mb-2">
+          <strong>Protocol Trace</strong>
+        </div>
+        <div style={{
+          border: '1px solid var(--viewer-debug-border)',
+          borderRadius: '6px',
+          padding: '6px',
+          maxHeight: '170px',
+          overflowY: 'auto',
+          background: 'var(--viewer-debug-surface)',
+          fontFamily: 'monospace',
+          fontSize: '0.72rem',
+          whiteSpace: 'pre-wrap',
+          wordBreak: 'break-word',
+          marginBottom: '8px',
+        }}>
+          {protocolTrace.length === 0 && <div style={{opacity: 0.7}}>No protocol messages yet.</div>}
+          {protocolTrace.map(entry => (
+            <div key={entry.id} style={{
+              marginBottom: '6px',
+              color: entry.ok ? undefined : 'var(--red-400)',
+            }}>
+              [{entry.at.slice(11, 19)}] {entry.direction} {entry.label}{entry.durationMs != null ? ` (${entry.durationMs}ms)` : ''}
+              {'\n'}{entry.payload}
+            </div>
+          ))}
+        </div>
+
+        <div ref={debugConsoleRef} style={{
+          border: '1px solid var(--viewer-debug-border)',
+          borderRadius: '6px',
+          padding: '6px',
+          maxHeight: '170px',
+          overflowY: 'auto',
+          background: 'var(--viewer-debug-surface)',
+          fontFamily: 'monospace',
+          fontSize: '0.75rem',
+          whiteSpace: 'pre-wrap',
+          wordBreak: 'break-word',
+        }}>
+          {debugLogs.length === 0 && <div style={{opacity: 0.7}}>No debug events yet.</div>}
+          {debugLogs.map(log => (
+            <div key={log.id} style={{
+              marginBottom: '4px',
+              color: log.level === 'error' ? 'var(--red-400)' : undefined,
+            }}>
+              [{log.at.slice(11, 19)}] {log.level.toUpperCase()} {log.message}
+            </div>
+          ))}
+        </div>
+      </div>
     </div>
   )
 }

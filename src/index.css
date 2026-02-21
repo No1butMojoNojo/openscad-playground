@@ -8,6 +8,24 @@ body {
   -moz-osx-font-smoothing: grayscale;
 }
 
+:root {
+  --viewer-debug-bg: rgba(255, 255, 255, 0.92);
+  --viewer-debug-border: #d7dce3;
+  --viewer-debug-surface: #f7f8fa;
+  --viewer-debug-text: #1f2937;
+  --viewer-debug-muted: #6b7280;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --viewer-debug-bg: rgba(20, 23, 28, 0.94);
+    --viewer-debug-border: #374151;
+    --viewer-debug-surface: #111827;
+    --viewer-debug-text: #e5e7eb;
+    --viewer-debug-muted: #9ca3af;
+  }
+}
+
 code {
   font-family: source-code-pro, Menlo, Monaco, Consolas, 'Courier New',
     monospace;
